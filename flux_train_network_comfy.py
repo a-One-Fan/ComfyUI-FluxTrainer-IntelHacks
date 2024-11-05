@@ -165,7 +165,9 @@ class FluxNetworkTrainer(NetworkTrainer):
                 clean_memory_on_device(accelerator.device)
 
             # When TE is not be trained, it will not be prepared so we need to use explicit autocast
-            logger.info("move text encoders to gpu")
+            te_use_cpu = args.te_use_cpu
+            te_dev = "cpu" if te_use_cpu else accelerator.device
+            logger.info(f"move text encoders to {te_dev} (Using cpu: {te_use_cpu})")
             text_encoders[0].to(accelerator.device, dtype=weight_dtype)
             text_encoders[1].to(accelerator.device, dtype=weight_dtype)
             with accelerator.autocast():

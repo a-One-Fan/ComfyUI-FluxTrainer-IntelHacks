@@ -303,6 +303,7 @@ class InitFluxLoRATraining:
             "guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 32.0, "step": 0.01, "tooltip": "guidance scale, for Flux training should be 1.0"}),
             "discrete_flow_shift": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.0001, "tooltip": "for the Euler Discrete Scheduler, default is 3.0"}),
             "highvram": ("BOOLEAN", {"default": False, "tooltip": "memory mode"}),
+            "te_use_cpu": ("BOOLEAN", {"default": False, "tooltip": "Cache Text Encoder outputs with CPU"}),
             "fp8_base": ("BOOLEAN", {"default": True, "tooltip": "use fp8 for base model"}),
             "gradient_dtype": (["fp32", "fp16", "bf16"], {"default": "fp32", "tooltip": "the actual dtype training uses"}),
             "save_dtype": (["fp32", "fp16", "bf16", "fp8_e4m3fn"], {"default": "bf16", "tooltip": "the dtype to save checkpoints as"}),
@@ -323,7 +324,7 @@ class InitFluxLoRATraining:
     CATEGORY = "FluxTrainer"
 
     def init_training(self, flux_models, dataset, optimizer_settings, sample_prompts, output_name, attention_mode, 
-                      gradient_dtype, save_dtype, split_mode, additional_args=None, resume_args=None, train_clip_l='disabled', **kwargs,):
+                      gradient_dtype, save_dtype, split_mode, te_use_cpu, additional_args=None, resume_args=None, train_clip_l='disabled', **kwargs,):
         mm.soft_empty_cache()
         
         output_dir = os.path.abspath(kwargs.get("output_dir"))
@@ -368,6 +369,8 @@ class InitFluxLoRATraining:
         else:
             kwargs["cache_text_encoder_outputs"] = False
             kwargs["cache_text_encoder_outputs_to_disk"] = False
+
+        kwargs["te_use_cpu"] = te_use_cpu
 
         if '|' in sample_prompts:
             prompts = sample_prompts.split('|')
@@ -471,6 +474,7 @@ class InitFluxTraining:
             "guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 32.0, "step": 0.01, "tooltip": "guidance scale"}),
             "discrete_flow_shift": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.0001, "tooltip": "for the Euler Discrete Scheduler, default is 3.0"}),
             "highvram": ("BOOLEAN", {"default": False, "tooltip": "memory mode"}),
+            "te_use_cpu": ("BOOLEAN", {"default": False, "tooltip": "Cache Text Encoder outputs with CPU"}),
             "fp8_base": ("BOOLEAN", {"default": False, "tooltip": "use fp8 for base model"}),
             "gradient_dtype": (["fp32", "fp16", "bf16"], {"default": "bf16", "tooltip": "to use the full fp16/bf16 training"}),
             "save_dtype": (["fp32", "fp16", "bf16", "fp8_e4m3fn"], {"default": "bf16", "tooltip": "the dtype to save checkpoints as"}),
@@ -489,7 +493,7 @@ class InitFluxTraining:
     CATEGORY = "FluxTrainer"
 
     def init_training(self, flux_models, optimizer_settings, dataset, sample_prompts, output_name, 
-                      attention_mode, gradient_dtype, save_dtype, optimizer_fusing, additional_args=None, resume_args=None, **kwargs,):
+                      attention_mode, gradient_dtype, save_dtype, optimizer_fusing, te_use_cpu, additional_args=None, resume_args=None, **kwargs,):
         mm.soft_empty_cache()
 
         output_dir = os.path.abspath(kwargs.get("output_dir"))
@@ -531,6 +535,8 @@ class InitFluxTraining:
         else:
             kwargs["cache_text_encoder_outputs"] = False
             kwargs["cache_text_encoder_outputs_to_disk"] = False
+
+        kwargs["te_use_cpu"] = te_use_cpu
 
         if '|' in sample_prompts:
             prompts = sample_prompts.split('|')
