@@ -450,12 +450,12 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, attn_mask: Optional[T
 
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     assert dim % 2 == 0
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=torch.device("cpu")) / dim
     omega = 1.0 / (theta**scale)
-    out = torch.einsum("...n,d->...nd", pos, omega)
+    out = torch.einsum("...n,d->...nd", pos.to("cpu"), omega)
     out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
     out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
-    return out.float()
+    return out.float().to(pos.device)
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
@@ -873,9 +873,10 @@ class Flux(nn.Module):
     Transformer model for flow matching on sequences.
     """
 
-    def __init__(self, params: FluxParams):
+    def __init__(self, params: FluxParams, opt_dtype=torch.float8_e4m3fn):
+        print("super init")
         super().__init__()
-
+        print("start")
         self.params = params
         self.in_channels = params.in_channels
         self.out_channels = self.in_channels
@@ -884,6 +885,7 @@ class Flux(nn.Module):
         pe_dim = params.hidden_size // params.num_heads
         if sum(params.axes_dim) != pe_dim:
             raise ValueError(f"Got {params.axes_dim} but expected positional dim {pe_dim}")
+        print("0")
         self.hidden_size = params.hidden_size
         self.num_heads = params.num_heads
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
@@ -892,7 +894,7 @@ class Flux(nn.Module):
         self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size)
         self.guidance_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size) if params.guidance_embed else nn.Identity()
         self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size)
-
+        print("1")
         self.double_blocks = nn.ModuleList(
             [
                 DoubleStreamBlock(
@@ -900,20 +902,20 @@ class Flux(nn.Module):
                     self.num_heads,
                     mlp_ratio=params.mlp_ratio,
                     qkv_bias=params.qkv_bias,
-                )
+                ).to(opt_dtype)
                 for _ in range(params.depth)
             ]
         )
-
+        print("2")
         self.single_blocks = nn.ModuleList(
             [
-                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio)
+                SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio).to(opt_dtype)
                 for _ in range(params.depth_single_blocks)
             ]
         )
-
+        print("3")
         self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
-
+        print("done")
         self.gradient_checkpointing = False
         self.cpu_offload_checkpointing = False
         self.double_blocks_to_swap = None

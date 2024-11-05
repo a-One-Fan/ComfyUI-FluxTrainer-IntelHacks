@@ -83,7 +83,7 @@ def sample_images(
     except Exception:
         pass
 
-    with torch.no_grad(), accelerator.autocast():
+    with torch.no_grad():
         image_tensor_list = []
         for prompt_dict in prompts:
             image_tensor = sample_image_inference(
@@ -155,11 +155,13 @@ def sample_image_inference(
 
     if seed is not None:
         torch.manual_seed(seed)
-        torch.cuda.manual_seed(seed)
+        #torch.cuda.manual_seed(seed)
+        torch.xpu.manual_seed(seed)
     else:
         # True random sample image generation
         torch.seed()
-        torch.cuda.seed()
+        #torch.cuda.seed()
+        torch.xpu.seed()
 
     # if negative_prompt is None:
     #     negative_prompt = ""
@@ -180,27 +182,13 @@ def sample_image_inference(
     tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
     encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-    text_encoder_conds = []
     if sample_prompts_te_outputs and prompt in sample_prompts_te_outputs:
-        text_encoder_conds = sample_prompts_te_outputs[prompt]
-        print(f"Using cached text encoder outputs for prompt: {prompt}")
-    if text_encoders is not None:
-        print(f"Encoding prompt: {prompt}")
+        te_outputs = sample_prompts_te_outputs[prompt]
+    else:
         tokens_and_masks = tokenize_strategy.tokenize(prompt)
-        # strategy has apply_t5_attn_mask option
-        encoded_text_encoder_conds = encoding_strategy.encode_tokens(tokenize_strategy, text_encoders, tokens_and_masks)
-        print([x.shape if x is not None else None for x in encoded_text_encoder_conds])
+        te_outputs = encoding_strategy.encode_tokens(tokenize_strategy, text_encoders, tokens_and_masks)
 
-        # if text_encoder_conds is not cached, use encoded_text_encoder_conds
-        if len(text_encoder_conds) == 0:
-            text_encoder_conds = encoded_text_encoder_conds
-        else:
-            # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
-            for i in range(len(encoded_text_encoder_conds)):
-                if encoded_text_encoder_conds[i] is not None:
-                    text_encoder_conds[i] = encoded_text_encoder_conds[i]
-
-    l_pooled, t5_out, txt_ids, t5_attn_mask = text_encoder_conds
+    l_pooled, t5_out, txt_ids, t5_attn_mask = te_outputs
 
     # sample image
     weight_dtype = ae.dtype  # TOFO give dtype as argument
@@ -536,7 +524,7 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--apply_t5_attn_mask",
         action="store_true",
-        help="apply attention mask to T5-XXL encode and FLUX double blocks / T5-XXLエンコードとFLUXダブルブロックにアテンションマスクを適用する",
+        help="apply attention mask (zero embs) to T5-XXL / T5-XXLにアテンションマスク（ゼロ埋め）を適用する",
     )
     parser.add_argument(
         "--cache_text_encoder_outputs", action="store_true", help="cache text encoder outputs / text encoderの出力をキャッシュする"
@@ -585,10 +573,9 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift"],
+        choices=["sigma", "uniform", "sigmoid"],
         default="sigma",
-        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid and FLUX.1 shifting."
-        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、FLUX.1のシフト。",
+        help="Method to sample timesteps: sigma-based, uniform random, or sigmoid of random normal. / タイムステップをサンプリングする方法：sigma、random uniform、またはrandom normalのsigmoid。",
     )
     parser.add_argument(
         "--sigmoid_scale",

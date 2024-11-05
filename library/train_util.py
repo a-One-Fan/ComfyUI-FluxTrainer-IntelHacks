@@ -13,7 +13,6 @@ import shutil
 import time
 from typing import (
     Any,
-    Callable,
     Dict,
     List,
     NamedTuple,
@@ -38,18 +37,15 @@ import torch
 from .device_utils import init_ipex, clean_memory_on_device
 from .strategy_base import LatentsCachingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy, TextEncodingStrategy
 
-init_ipex()
+#init_ipex()
+#import pdb
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 from torchvision import transforms
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 import transformers
-from diffusers.optimization import (
-    SchedulerType as DiffusersSchedulerType,
-    TYPE_TO_SCHEDULER_FUNCTION as DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION,
-)
-from transformers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
+from diffusers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
 from diffusers import (
     StableDiffusionPipeline,
     DDPMScheduler,
@@ -78,7 +74,7 @@ from . import model_util as model_util
 from . import huggingface_util as huggingface_util
 from . import sai_model_spec as sai_model_spec
 from . import deepspeed_utils as deepspeed_utils
-from .utils import setup_logging, pil_resize
+from .utils import setup_logging
 
 setup_logging()
 import logging
@@ -1054,26 +1050,9 @@ class BaseDataset(torch.utils.data.Dataset):
         # sort by resolution
         image_infos.sort(key=lambda info: info.bucket_reso[0] * info.bucket_reso[1])
 
-        # split by resolution and some conditions
-        class Condition:
-            def __init__(self, reso, flip_aug, alpha_mask, random_crop):
-                self.reso = reso
-                self.flip_aug = flip_aug
-                self.alpha_mask = alpha_mask
-                self.random_crop = random_crop
-
-            def __eq__(self, other):
-                return (
-                    self.reso == other.reso
-                    and self.flip_aug == other.flip_aug
-                    and self.alpha_mask == other.alpha_mask
-                    and self.random_crop == other.random_crop
-                )
-
-        batches: List[Tuple[Condition, List[ImageInfo]]] = []
-        batch: List[ImageInfo] = []
-        current_condition = None
-
+        # split by resolution
+        batches = []
+        batch = []
         logger.info("checking cache validity...")
         for info in tqdm(image_infos):
             subset = self.image_to_subset[info.image_key]
@@ -1094,31 +1073,28 @@ class BaseDataset(torch.utils.data.Dataset):
                 if cache_available:  # do not add to batch
                     continue
 
-            # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
-            condition = Condition(info.bucket_reso, subset.flip_aug, subset.alpha_mask, subset.random_crop)
-            if len(batch) > 0 and current_condition != condition:
-                batches.append((current_condition, batch))
+            # if last member of batch has different resolution, flush the batch
+            if len(batch) > 0 and batch[-1].bucket_reso != info.bucket_reso:
+                batches.append(batch)
                 batch = []
 
             batch.append(info)
-            current_condition = condition
 
             # if number of data in batch is enough, flush the batch
             if len(batch) >= vae_batch_size:
-                batches.append((current_condition, batch))
+                batches.append(batch)
                 batch = []
-                current_condition = None
 
         if len(batch) > 0:
-            batches.append((current_condition, batch))
+            batches.append(batch)
 
         if cache_to_disk and not is_main_process:  # if cache to disk, don't cache latents in non-main process, set to info only
             return
 
         # iterate batches: batch doesn't have image, image will be loaded in cache_batch_latents and discarded
         logger.info("caching latents...")
-        for condition, batch in tqdm(batches, smoothing=1, total=len(batches)):
-            cache_batch_latents(vae, cache_to_disk, batch, condition.flip_aug, condition.alpha_mask, condition.random_crop)
+        for batch in tqdm(batches, smoothing=1, total=len(batches)):
+            cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
 
     def new_cache_text_encoder_outputs(self, models: List[Any], is_main_process: bool):
         r"""
@@ -1128,6 +1104,10 @@ class BaseDataset(torch.utils.data.Dataset):
         text_encoding_strategy = TextEncodingStrategy.get_strategy()
         caching_strategy = TextEncoderOutputsCachingStrategy.get_strategy()
         batch_size = caching_strategy.batch_size or self.batch_size
+
+        # if cache to disk, don't cache TE outputs in non-main process
+        if caching_strategy.cache_to_disk and not is_main_process:
+            return
 
         logger.info("caching Text Encoder outputs with caching strategy.")
         image_infos = list(self.image_data.values())
@@ -1141,7 +1121,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
             # check disk cache exists and size of latents
             if caching_strategy.cache_to_disk:
-                info.text_encoder_outputs_npz = te_out_npz  # set npz filename regardless of cache availability/main process
+                info.text_encoder_outputs_npz = te_out_npz
                 cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
                 if cache_available:  # do not add to batch
                     continue
@@ -1805,8 +1785,6 @@ class DreamBoothDataset(BaseDataset):
 
             self.set_tag_frequency(os.path.basename(subset.image_dir), captions)  # タグ頻度を記録
 
-            logger.info(f"Found captions for {len(captions) - len(missing_captions)} images.")
-            
             if missing_captions:
                 number_of_missing_captions = len(missing_captions)
                 number_of_missing_captions_to_show = 5
@@ -2297,7 +2275,9 @@ class ControlNetDataset(BaseDataset):
                 # ), f"image size is small / 画像サイズが小さいようです: {image_info.absolute_path}"
                 # resize to target
                 if cond_img.shape[0] != target_size_hw[0] or cond_img.shape[1] != target_size_hw[1]:
-                    cond_img = pil_resize(cond_img, (int(target_size_hw[1]), int(target_size_hw[0])))
+                    cond_img = cv2.resize(
+                        cond_img, (int(target_size_hw[1]), int(target_size_hw[0])), interpolation=cv2.INTER_LANCZOS4
+                    )
 
             if flipped:
                 cond_img = cond_img[:, ::-1, :].copy()  # copy to avoid negative stride
@@ -2436,7 +2416,7 @@ def is_disk_cached_latents_is_expected(reso, npz_path: str, flip_aug: bool, alph
         if alpha_mask:
             if "alpha_mask" not in npz:
                 return False
-            if (npz["alpha_mask"].shape[1], npz["alpha_mask"].shape[0]) != reso:  # HxW => WxH != reso
+            if npz["alpha_mask"].shape[0:2] != reso:  # HxW
                 return False
         else:
             if "alpha_mask" in npz:
@@ -2545,7 +2525,7 @@ def debug_dataset(train_dataset, show_input_ids=False):
                     if "alpha_masks" in example and example["alpha_masks"] is not None:
                         alpha_mask = example["alpha_masks"][j]
                         logger.info(f"alpha mask size: {alpha_mask.size()}")
-                        alpha_mask = (alpha_mask.numpy() * 255.0).astype(np.uint8)
+                        alpha_mask = (alpha_mask[0].numpy() * 255.0).astype(np.uint8)
                         if os.name == "nt":
                             cv2.imshow("alpha_mask", alpha_mask)
 
@@ -2666,7 +2646,7 @@ def load_arbitrary_dataset(args, tokenizer=None) -> MinimalDataset:
     return train_dataset_group
 
 
-def load_image(image_path, alpha=False):
+def load_image(image_path, alpha=False):    
     try:
         with Image.open(image_path) as image:
             if alpha:
@@ -2691,10 +2671,7 @@ def trim_and_resize_if_required(
 
     if image_width != resized_size[0] or image_height != resized_size[1]:
         # リサイズする
-        if image_width > resized_size[0] and image_height > resized_size[1]:
-            image = cv2.resize(image, resized_size, interpolation=cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
-        else:
-            image = pil_resize(image, resized_size)
+        image = cv2.resize(image, resized_size, interpolation=cv2.INTER_AREA)  # INTER_AREAでやりたいのでcv2でリサイズ
 
     image_height, image_width = image.shape[0:2]
 
@@ -3191,7 +3168,7 @@ SS_METADATA_MINIMUM_KEYS = [
 
 
 def build_minimum_network_metadata(
-    v2: Optional[str],
+    v2: Optional[bool],
     base_model: Optional[str],
     network_module: str,
     network_dim: str,
@@ -3284,20 +3261,6 @@ def add_sd_models_arguments(parser: argparse.ArgumentParser):
 
 
 def add_optimizer_arguments(parser: argparse.ArgumentParser):
-    def int_or_float(value):
-        if value.endswith("%"):
-            try:
-                return float(value[:-1]) / 100.0
-            except ValueError:
-                raise argparse.ArgumentTypeError(f"Value '{value}' is not a valid percentage")
-        try:
-            float_value = float(value)
-            if float_value >= 1:
-                return int(value)
-            return float(value)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"'{value}' is not an int or float")
-
     parser.add_argument(
         "--optimizer_type",
         type=str,
@@ -3350,17 +3313,9 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--lr_warmup_steps",
-        type=int_or_float,
+        type=int,
         default=0,
-        help="Int number of steps for the warmup in the lr scheduler (default is 0) or float with ratio of train steps"
-        " / 学習率のスケジューラをウォームアップするステップ数（デフォルト0）、または学習ステップの比率（1未満のfloat値の場合）",
-    )
-    parser.add_argument(
-        "--lr_decay_steps",
-        type=int_or_float,
-        default=0,
-        help="Int number of steps for the decay in the lr scheduler (default is 0) or float (<1) with ratio of train steps"
-        " / 学習率のスケジューラを減衰させるステップ数（デフォルト0）、または学習ステップの比率（1未満のfloat値の場合）",
+        help="Number of steps for the warmup in the lr scheduler (default is 0) / 学習率のスケジューラをウォームアップするステップ数（デフォルト0）",
     )
     parser.add_argument(
         "--lr_scheduler_num_cycles",
@@ -3379,20 +3334,6 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Combines backward pass and optimizer step to reduce VRAM usage. Only available in SDXL"
         + " / バックワードパスとオプティマイザステップを組み合わせてVRAMの使用量を削減します。SDXLでのみ有効",
-    )
-    parser.add_argument(
-        "--lr_scheduler_timescale",
-        type=int,
-        default=None,
-        help="Inverse sqrt timescale for inverse sqrt scheduler,defaults to `num_warmup_steps`"
-        + " / 逆平方根スケジューラのタイムスケール、デフォルトは`num_warmup_steps`",
-    )
-    parser.add_argument(
-        "--lr_scheduler_min_lr_ratio",
-        type=float,
-        default=None,
-        help="The minimum learning rate as a ratio of the initial learning rate for cosine with min lr scheduler and warmup decay scheduler"
-        + " / 初期学習率の比率としての最小学習率を指定する、cosine with min lr と warmup decay スケジューラ で有効",
     )
 
 
@@ -3581,13 +3522,6 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         "--full_bf16", action="store_true", help="bf16 training including gradients / 勾配も含めてbf16で学習する"
     )  # TODO move to SDXL training, because it is not supported by SD1/2
     parser.add_argument("--fp8_base", action="store_true", help="use fp8 for base model / base modelにfp8を使う")
-    parser.add_argument(
-        "--fp8_dtype",
-        type=str,
-        default="e4m3",
-        choices=["e4m3", "e5m2"],
-        help="fp8 dtype selection",
-    )
 
     parser.add_argument(
         "--ddp_timeout",
@@ -4168,23 +4102,23 @@ def add_dataset_arguments(
     )
 
     if support_caption_dropout:
-        # Textual Inversion はcaptionのdropoutをsupportしない
-        # いわゆるtensorのDropoutと紛らわしいのでprefixにcaptionを付けておく　every_n_epochsは他と平仄を合わせてdefault Noneに
-        parser.add_argument(
-            "--caption_dropout_rate", type=float, default=0.0, help="Rate out dropout caption(0.0~1.0) / captionをdropoutする割合"
-        )
-        parser.add_argument(
-            "--caption_dropout_every_n_epochs",
-            type=int,
-            default=0,
-            help="Dropout all captions every N epochs / captionを指定エポックごとにdropoutする",
-        )
-        parser.add_argument(
-            "--caption_tag_dropout_rate",
-            type=float,
-            default=0.0,
-            help="Rate out dropout comma separated tokens(0.0~1.0) / カンマ区切りのタグをdropoutする割合",
-        )
+       # Textual Inversion does not support caption dropout
+       # To avoid confusion with tensor Dropout, prefix with caption. Set every_n_epochs to None by default to match others
+       parser.add_argument(
+           "--caption_dropout_rate", type=float, default=0.0, help="Rate of dropout caption (0.0~1.0) / Percentage of captions to dropout"
+       )
+       parser.add_argument(
+           "--caption_dropout_every_n_epochs",
+           type=int,
+           default=0,
+           help="Dropout all captions every N epochs / Dropout captions every specified number of epochs",
+       )
+       parser.add_argument(
+           "--caption_tag_dropout_rate",
+           type=float,
+           default=0.0,
+           help="Rate of dropout comma separated tokens (0.0~1.0) / Percentage of comma-separated tags to dropout",
+       )
 
     if support_dreambooth:
         # DreamBooth dataset
@@ -4456,22 +4390,7 @@ def get_optimizer(args, trainable_params):
                 raise AttributeError(
                     "No PagedLion8bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later. / PagedLion8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
                 )
-        elif optimizer_type == "Ademamix8bit".lower():
-            logger.info(f"use 8-bit Ademamix optimizer | {optimizer_kwargs}")
-            try:
-                optimizer_class = bnb.optim.AdEMAMix8bit
-            except AttributeError:
-                raise AttributeError(
-                    "No Ademamix8bit. The version of bitsandbytes installed seems to be old. Please install 0.44.0 or later. / Ademamix8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
-                )
-        elif optimizer_type == "PagedAdemamix8bit".lower():
-            logger.info(f"use 8-bit PagedAdemamix optimizer | {optimizer_kwargs}")
-            try:
-                optimizer_class = bnb.optim.PagedAdEMAMix8bit
-            except AttributeError:
-                raise AttributeError(
-                    "No PagedAdemamix8bit. The version of bitsandbytes installed seems to be old. Please install 0.44.0 or later. / PagedAdemamix8bitが定義されていません。インストールされているbitsandbytesのバージョンが古いようです。0.39.0以上をインストールしてください"
-                )
+
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     elif optimizer_type == "PagedAdamW".lower():
@@ -4634,23 +4553,6 @@ def get_optimizer(args, trainable_params):
         optimizer_class = torch.optim.AdamW
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
-    elif optimizer_type.endswith("schedulefree".lower()):
-        try:
-            import schedulefree as sf
-        except ImportError:
-            raise ImportError("No schedulefree / schedulefreeがインストールされていないようです")
-        if optimizer_type == "AdamWScheduleFree".lower():
-            optimizer_class = sf.AdamWScheduleFree
-            logger.info(f"use AdamWScheduleFree optimizer | {optimizer_kwargs}")
-        elif optimizer_type == "SGDScheduleFree".lower():
-            optimizer_class = sf.SGDScheduleFree
-            logger.info(f"use SGDScheduleFree optimizer | {optimizer_kwargs}")
-        else:
-            raise ValueError(f"Unknown optimizer type: {optimizer_type}")
-        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
-        # make optimizer as train mode: we don't need to call train again, because eval will not be called in training loop
-        optimizer.train()
-
     elif optimizer_type == "CAME".lower():
         logger.info(f"use CAME optimizer | {optimizer_kwargs}")
         try:
@@ -4667,55 +4569,22 @@ def get_optimizer(args, trainable_params):
 
     if optimizer is None:
         # 任意のoptimizerを使う
-        case_sensitive_optimizer_type = args.optimizer_type  # not lower
-        logger.info(f"use {case_sensitive_optimizer_type} | {optimizer_kwargs}")
-        if "." not in case_sensitive_optimizer_type:  # from torch.optim
+        optimizer_type = args.optimizer_type  # lowerでないやつ（微妙）
+        logger.info(f"use {optimizer_type} | {optimizer_kwargs}")
+        if "." not in optimizer_type:
             optimizer_module = torch.optim
-        else:  # from other library
-            values = case_sensitive_optimizer_type.split(".")
+        else:
+            values = optimizer_type.split(".")
             optimizer_module = importlib.import_module(".".join(values[:-1]))
-            case_sensitive_optimizer_type = values[-1]
+            optimizer_type = values[-1]
 
-        optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+        optimizer_class = getattr(optimizer_module, optimizer_type)
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     optimizer_name = optimizer_class.__module__ + "." + optimizer_class.__name__
     optimizer_args = ",".join([f"{k}={v}" for k, v in optimizer_kwargs.items()])
 
     return optimizer_name, optimizer_args, optimizer
-
-
-def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) -> Tuple[Callable, Callable]:
-    if not is_schedulefree_optimizer(optimizer, args):
-        # return dummy func
-        return lambda: None, lambda: None
-
-    # get train and eval functions from optimizer
-    train_fn = optimizer.train
-    eval_fn = optimizer.eval
-
-    return train_fn, eval_fn
-
-
-def is_schedulefree_optimizer(optimizer: Optimizer, args: argparse.Namespace) -> bool:
-    return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
-
-
-def get_dummy_scheduler(optimizer: Optimizer) -> Any:
-    # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
-    # this scheduler is used for logging only.
-    # this isn't be wrapped by accelerator because of this class is not a subclass of torch.optim.lr_scheduler._LRScheduler
-    class DummyScheduler:
-        def __init__(self, optimizer: Optimizer):
-            self.optimizer = optimizer
-
-        def step(self):
-            pass
-
-        def get_last_lr(self):
-            return [group["lr"] for group in self.optimizer.param_groups]
-
-    return DummyScheduler(optimizer)
 
 
 # Modified version of get_scheduler() function from diffusers.optimizer.get_scheduler
@@ -4726,23 +4595,11 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     """
     Unified API to get any scheduler from its name.
     """
-    # if schedulefree optimizer, return dummy scheduler
-    if is_schedulefree_optimizer(optimizer, args):
-        return get_dummy_scheduler(optimizer)
-
     name = args.lr_scheduler
+    num_warmup_steps: Optional[int] = args.lr_warmup_steps
     num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
-    num_warmup_steps: Optional[int] = (
-        int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
-    )
-    num_decay_steps: Optional[int] = (
-        int(args.lr_decay_steps * num_training_steps) if isinstance(args.lr_decay_steps, float) else args.lr_decay_steps
-    )
-    num_stable_steps = num_training_steps - num_warmup_steps - num_decay_steps
     num_cycles = args.lr_scheduler_num_cycles
     power = args.lr_scheduler_power
-    timescale = args.lr_scheduler_timescale
-    min_lr_ratio = args.lr_scheduler_min_lr_ratio
 
     lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
     if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
@@ -4778,16 +4635,14 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         # logger.info(f"adafactor scheduler init lr {initial_lr}")
         return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
 
-    if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
-        name = DiffusersSchedulerType(name)
-        schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
-        return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
-
     name = SchedulerType(name)
     schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
 
     if name == SchedulerType.CONSTANT:
         return wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs))
+
+    if name == SchedulerType.PIECEWISE_CONSTANT:
+        return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
 
     # All other schedulers require `num_warmup_steps`
     if num_warmup_steps is None:
@@ -4795,9 +4650,6 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
 
     if name == SchedulerType.CONSTANT_WITH_WARMUP:
         return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs)
-
-    if name == SchedulerType.INVERSE_SQRT:
-        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs)
 
     # All other schedulers require `num_training_steps`
     if num_training_steps is None:
@@ -4817,46 +4669,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, power=power, **lr_scheduler_kwargs
         )
 
-    if name == SchedulerType.COSINE_WITH_MIN_LR:
-        return schedule_func(
-            optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps,
-            num_cycles=num_cycles / 2,
-            min_lr_rate=min_lr_ratio,
-            **lr_scheduler_kwargs,
-        )
-
-    # these schedulers do not require `num_decay_steps`
-    if name == SchedulerType.LINEAR or name == SchedulerType.COSINE:
-        return schedule_func(
-            optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps,
-            **lr_scheduler_kwargs,
-        )
-
-    # All other schedulers require `num_decay_steps`
-    if num_decay_steps is None:
-        raise ValueError(f"{name} requires `num_decay_steps`, please provide that argument.")
-    if name == SchedulerType.WARMUP_STABLE_DECAY:
-        return schedule_func(
-            optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_stable_steps=num_stable_steps,
-            num_decay_steps=num_decay_steps,
-            num_cycles=num_cycles / 2,
-            min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
-            **lr_scheduler_kwargs,
-        )
-
-    return schedule_func(
-        optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_training_steps,
-        num_decay_steps=num_decay_steps,
-        **lr_scheduler_kwargs,
-    )
+    return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, **lr_scheduler_kwargs)
 
 
 def prepare_dataset_args(args: argparse.Namespace, support_metadata: bool):
@@ -4941,6 +4754,9 @@ def prepare_accelerator(args: argparse.Namespace):
     kwargs_handlers = list(filter(lambda x: x is not None, kwargs_handlers))
     deepspeed_plugin = deepspeed_utils.prepare_deepspeed_plugin(args)
 
+    #os.environ['CUDA_VISIBLE_DEVICES'] = ""
+    print(args)
+    #pdb.set_trace()
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -4951,6 +4767,8 @@ def prepare_accelerator(args: argparse.Namespace):
         deepspeed_plugin=deepspeed_plugin,
     )
     print("accelerator device:", accelerator.device)
+    #accelerator.device = torch.device("xpu")
+    #print("new accelerator device:", accelerator.device)
     return accelerator
 
 
@@ -4970,8 +4788,6 @@ def prepare_dtype(args: argparse.Namespace):
         save_dtype = torch.float32
     elif args.save_precision == "fp8_e4m3fn":
         save_dtype = torch.float8_e4m3fn
-    elif args.save_precision == "fp8_e5m2":
-        save_dtype = torch.float8_e5m2
 
     return weight_dtype, save_dtype
 
@@ -5508,27 +5324,34 @@ def save_sd_model_on_train_end_common(
 
 
 def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, device):
-    timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
+
+    # TODO: if a huber loss is selected, it will use constant timesteps for each batch
+    # as. In the future there may be a smarter way
 
     if args.loss_type == "huber" or args.loss_type == "smooth_l1":
+        timesteps = torch.randint(min_timestep, max_timestep, (1,), device="cpu")
+        timestep = timesteps.item()
+
         if args.huber_schedule == "exponential":
             alpha = -math.log(args.huber_c) / noise_scheduler.config.num_train_timesteps
-            huber_c = torch.exp(-alpha * timesteps)
+            huber_c = math.exp(-alpha * timestep)
         elif args.huber_schedule == "snr":
-            alphas_cumprod = torch.index_select(noise_scheduler.alphas_cumprod, 0, timesteps)
+            alphas_cumprod = noise_scheduler.alphas_cumprod[timestep]
             sigmas = ((1.0 - alphas_cumprod) / alphas_cumprod) ** 0.5
             huber_c = (1 - args.huber_c) / (1 + sigmas) ** 2 + args.huber_c
         elif args.huber_schedule == "constant":
-            huber_c = torch.full((b_size,), args.huber_c)
+            huber_c = args.huber_c
         else:
             raise NotImplementedError(f"Unknown Huber loss schedule {args.huber_schedule}!")
-        huber_c = huber_c.to(device)
+
+        timesteps = timesteps.repeat(b_size).to(device)
     elif args.loss_type == "l2":
-        huber_c = None  # may be anything, as it's not used
+        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device)
+        huber_c = 1  # may be anything, as it's not used
     else:
         raise NotImplementedError(f"Unknown loss type {args.loss_type}")
+    timesteps = timesteps.long()
 
-    timesteps = timesteps.long().to(device)
     return timesteps, huber_c
 
 
@@ -5567,22 +5390,21 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
     return noise, noisy_latents, timesteps, huber_c
 
 
+# NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
 def conditional_loss(
-    model_pred: torch.Tensor, target: torch.Tensor, reduction: str, loss_type: str, huber_c: Optional[torch.Tensor]
+    model_pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean", loss_type: str = "l2", huber_c: float = 0.1
 ):
     if loss_type == "l2":
         loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
     elif loss_type == "l1":
         loss = torch.nn.functional.l1_loss(model_pred, target, reduction=reduction)
     elif loss_type == "huber":
-        huber_c = huber_c.view(-1, 1, 1, 1)
         loss = 2 * huber_c * (torch.sqrt((model_pred - target) ** 2 + huber_c**2) - huber_c)
         if reduction == "mean":
             loss = torch.mean(loss)
         elif reduction == "sum":
             loss = torch.sum(loss)
     elif loss_type == "smooth_l1":
-        huber_c = huber_c.view(-1, 1, 1, 1)
         loss = 2 * (torch.sqrt((model_pred - target) ** 2 + huber_c**2) - huber_c)
         if reduction == "mean":
             loss = torch.mean(loss)
@@ -5868,7 +5690,7 @@ def sample_images_common(
     clean_memory_on_device(accelerator.device)
 
     torch.set_rng_state(rng_state)
-    if torch.cuda.is_available() and cuda_rng_state is not None:
+    if cuda_rng_state is not None:
         torch.cuda.set_rng_state(cuda_rng_state)
     vae.to(org_vae_device)
 
@@ -5902,13 +5724,11 @@ def sample_image_inference(
 
     if seed is not None:
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
     else:
         # True random sample image generation
         torch.seed()
-        if torch.cuda.is_available():
-            torch.cuda.seed()
+        torch.cuda.seed()
 
     scheduler = get_my_scheduler(
         sample_sampler=sampler_name,
@@ -5943,9 +5763,8 @@ def sample_image_inference(
             controlnet_image=controlnet_image,
         )
 
-    if torch.cuda.is_available():
-        with torch.cuda.device(torch.cuda.current_device()):
-            torch.cuda.empty_cache()
+    with torch.cuda.device(torch.cuda.current_device()):
+        torch.cuda.empty_cache()
 
     image = pipeline.latents_to_image(latents)[0]
 
@@ -5959,14 +5778,17 @@ def sample_image_inference(
     img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
     image.save(os.path.join(save_dir, img_filename))
 
-    # send images to wandb if enabled
-    if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+    # wandb有効時のみログを送信
+    try:
         wandb_tracker = accelerator.get_tracker("wandb")
+        try:
+            import wandb
+        except ImportError:  # 事前に一度確認するのでここはエラー出ないはず
+            raise ImportError("No wandb / wandb がインストールされていないようです")
 
-        import wandb
-
-        # not to commit images to avoid inconsistency between training and logging steps
-        wandb_tracker.log({f"sample_{i}": wandb.Image(image, caption=prompt)}, commit=False)  # positive prompt as a caption
+        wandb_tracker.log({f"sample_{i}": wandb.Image(image)})
+    except:  # wandb 無効時
+        pass
 
 
 # endregion
